@@ -6,41 +6,44 @@
  */
 
 import { inject, injectable, postConstruct } from 'inversify';
-import { EditorManager, EditorWidget } from '@theia/editor/lib/browser';
-import { Workspace } from '@theia/languages/lib/common';
+import { EditorManager, EditorWidget, TextEditor, TextEditorDocument } from '@theia/editor/lib/browser';
 import URI from '@theia/core/lib/common/uri';
 import { DiffComputer, DirtyDiff } from './diff-computer';
-import { Emitter, Event, Disposable, ReferenceCollection } from '@theia/core';
+import { Emitter, Event, Disposable, DisposableCollection } from '@theia/core';
 import { GitPreferences, GitConfiguration } from '../git-preferences';
 import { PreferenceChangeEvent } from '@theia/core/lib/browser';
 import { GitResourceResolver, GIT_RESOURCE_SCHEME } from '../git-resource';
 import { WorkingDirectoryStatus, GitFileStatus, GitFileChange, Repository } from '../../common';
 import { GitRepositoryTracker } from '../git-repository-tracker';
+import { ContentLines } from './content-lines';
+
+import throttle = require('lodash.throttle');
 
 @injectable()
 export class DirtyDiffManager {
 
-    protected readonly models = new ReferenceCollection<string, DirtyDiffModel>(
-        uri => this.createNewModel(uri)
-    );
+    protected readonly models = new Map<string, DirtyDiffModel>();
 
     protected readonly onDirtyDiffUpdateEmitter = new Emitter<DirtyDiffUpdate>();
     readonly onDirtyDiffUpdate: Event<DirtyDiffUpdate> = this.onDirtyDiffUpdateEmitter.event;
 
-    @inject(GitRepositoryTracker) protected readonly repositoryTracker: GitRepositoryTracker;
-    @inject(GitResourceResolver) protected readonly gitResourceResolver: GitResourceResolver;
+    @inject(GitRepositoryTracker)
+    protected readonly repositoryTracker: GitRepositoryTracker;
 
-    @inject(EditorManager) protected readonly editorManager: EditorManager;
+    @inject(GitResourceResolver)
+    protected readonly gitResourceResolver: GitResourceResolver;
 
-    @inject(Workspace) protected readonly workspace: Workspace;
-    @inject(GitPreferences) protected readonly preferences: GitPreferences;
+    @inject(EditorManager)
+    protected readonly editorManager: EditorManager;
+
+    @inject(GitPreferences)
+    protected readonly preferences: GitPreferences;
 
     @postConstruct()
     protected async initialize() {
-        this.workspace.onDidChangeTextDocument(async params => await this.handleDocumentChanged(params.textDocument.uri));
         this.preferences.onPreferenceChanged(async e => await this.handlePreferenceChange(e));
         this.editorManager.onCreated(async e => await this.handleEditorCreated(e));
-        this.repositoryTracker.onGitEvent(async event => await this.handleGitStatusUpdate(event.source, event.status));
+        this.repositoryTracker.onGitEvent(throttle(async event => await this.handleGitStatusUpdate(event.source, event.status), 500));
         const gitStatus = this.repositoryTracker.selectedRepositoryStatus;
         const repository = this.repositoryTracker.selectedRepository;
         if (gitStatus && repository) {
@@ -50,24 +53,30 @@ export class DirtyDiffManager {
 
     protected async handleEditorCreated(editorWidget: EditorWidget): Promise<void> {
         const editor = editorWidget.editor;
-        const uri = editor.document.uri;
-        if (new URI(uri).scheme !== 'file') {
+        const uri = editor.uri.toString();
+        if (editor.uri.scheme !== 'file') {
             return;
         }
-        const reference = await this.models.acquire(uri);
-        editorWidget.disposed.connect(() => reference.dispose());
-        const model = reference.object;
+        const toDispose = new DisposableCollection();
+        const model = this.createNewModel(editor);
+        toDispose.push(model);
+        this.models.set(uri, model);
+        toDispose.push(editor.onDocumentContentChanged(throttle((document: TextEditorDocument) => model.handleDocumentChanged(document), 1000)));
+        editorWidget.disposed.connect(() => {
+            this.models.delete(uri);
+            toDispose.dispose();
+        });
         const gitStatus = this.repositoryTracker.selectedRepositoryStatus;
         const repository = this.repositoryTracker.selectedRepository;
         if (gitStatus && repository) {
             const changes = gitStatus.changes.filter(c => c.uri === uri);
             await model.handleGitStatusUpdate(repository, changes);
         }
-        model.handleDocumentChanged(editor.document.getText());
+        model.handleDocumentChanged(editor.document);
     }
 
-    protected createNewModel(uri: string): DirtyDiffModel {
-        const model = new DirtyDiffModel(uri, async gitUri => await this.readGitResourceContents(gitUri));
+    protected createNewModel(editor: TextEditor): DirtyDiffModel {
+        const model = new DirtyDiffModel(editor, async gitUri => await this.readGitResourceContents(gitUri));
         model.onDirtyDiffUpdate(e => this.onDirtyDiffUpdateEmitter.fire(e));
         model.enabled = this.isEnabled();
         return model;
@@ -78,22 +87,11 @@ export class DirtyDiffManager {
         return gitResource.readContents();
     }
 
-    protected async handleDocumentChanged(uri: string): Promise<void> {
-        const model = await this.getModel(uri);
-        if (model) {
-            const document = this.workspace.textDocuments.find(d => d.uri === uri);
-            if (document) {
-                model.handleDocumentChanged(document.getText());
-            }
-        }
-    }
-
     protected async handleGitStatusUpdate(repository: Repository, status: WorkingDirectoryStatus): Promise<void> {
         const uris = new Set(this.models.keys());
         const relevantChanges = status.changes.filter(c => uris.has(c.uri));
-        const models = await this.allModels();
-        for (const model of models) {
-            const uri = model.uri;
+        for (const model of this.models.values()) {
+            const uri = model.editor.uri.toString();
             const changes = relevantChanges.filter(c => c.uri === uri);
             await model.handleGitStatusUpdate(repository, changes);
         }
@@ -107,39 +105,18 @@ export class DirtyDiffManager {
         const { preferenceName, newValue } = event;
         if (preferenceName === "git.editor.decorations.enabled") {
             const enabled = !!newValue;
-            const models = await this.allModels();
-            for (const model of models) {
+            const allModels = this.models.values();
+            for (const model of allModels) {
                 model.enabled = enabled;
                 model.update();
             }
         }
     }
 
-    protected async allModels(): Promise<DirtyDiffModel[]> {
-        const models = [];
-        const uris = this.models.keys();
-        for (const uri of uris) {
-            const reference = await this.models.acquire(uri);
-            models.push(reference.object);
-            reference.dispose();
-        }
-        return models;
-    }
-
-    protected async getModel(uri: string): Promise<DirtyDiffModel | undefined> {
-        if (this.models.has(uri)) {
-            const reference = await this.models.acquire(uri);
-            const model = reference.object;
-            reference.dispose();
-            return model;
-        }
-        return undefined;
-    }
-
 }
 
 export interface DirtyDiffUpdate extends DirtyDiff {
-    readonly uri: string;
+    readonly editor: TextEditor;
 }
 
 export class DirtyDiffModel implements Disposable {
@@ -148,37 +125,49 @@ export class DirtyDiffModel implements Disposable {
 
     protected dirty = true;
     protected staged: boolean;
-    protected previousContent: string[];
-    protected currentContent: string[];
+    protected previousContent: ContentLines | undefined;
+    protected currentContent: ContentLines | undefined;
 
     protected readonly onDirtyDiffUpdateEmitter = new Emitter<DirtyDiffUpdate>();
     readonly onDirtyDiffUpdate: Event<DirtyDiffUpdate> = this.onDirtyDiffUpdateEmitter.event;
-    protected readonly updateDelayer = new DirtyDiffModel.Throttler(200);
 
     constructor(
-        readonly uri: string,
+        readonly editor: TextEditor,
         protected readonly readGitResource: DirtyDiffModel.GitResourceReader
     ) { }
 
+    protected updateTimeout: number | undefined;
+
     update(): void {
+        const editor = this.editor;
         const enabled = this.enabled && this.dirty;
-        const previous = enabled ? this.previousContent : [];
-        const current = enabled ? this.currentContent : [];
-        if (!previous || !current) {
+        if (!enabled || !this.previousContent || !this.currentContent) {
+            this.onDirtyDiffUpdateEmitter.fire({ editor, added: [], removed: [], modified: [] });
             return;
         }
-        const uri = this.uri;
-        this.updateDelayer.push(() => {
-            const dirtyDiff = enabled
-                ? DirtyDiffModel.computeDirtyDiff(previous, current)
-                : <DirtyDiff>{ added: [], removed: [], modified: [] };
-            const dirtyDiffUpdate = <DirtyDiffUpdate>{ uri, ...dirtyDiff };
+        if (this.updateTimeout) {
+            window.clearTimeout(this.updateTimeout);
+        }
+        this.updateTimeout = window.setTimeout(() => {
+            const previous = this.previousContent;
+            const current = this.currentContent;
+            if (!previous || !current) {
+                return;
+            }
+            this.updateTimeout = undefined;
+            const dirtyDiff = DirtyDiffModel.computeDirtyDiff(previous, current);
+            if (!dirtyDiff) {
+                // if the computation fails, it might be because of changes in the editor, in that case
+                // a new update task should be scheduled anyway.
+                return;
+            }
+            const dirtyDiffUpdate = <DirtyDiffUpdate>{ editor, ...dirtyDiff };
             this.onDirtyDiffUpdateEmitter.fire(dirtyDiffUpdate);
-        });
+        }, 100);
     }
 
-    handleDocumentChanged(documentContent: string): void {
-        this.currentContent = DirtyDiffModel.splitLines(documentContent);
+    handleDocumentChanged(document: TextEditorDocument): void {
+        this.currentContent = DirtyDiffModel.documentContentLines(document);
         this.update();
     }
 
@@ -195,12 +184,12 @@ export class DirtyDiffModel implements Disposable {
                 this.previousContent = await this.getPreviousRevision();
             } catch {
                 this.dirty = false;
-                this.previousContent = [];
+                this.previousContent = undefined;
             }
         }
         if (isNewAndUnstaged && !isNewAndStaged) {
             this.dirty = false;
-            this.previousContent = [];
+            this.previousContent = undefined;
         }
         if (noRelevantChanges && this.isInGitRepository(repository)) {
             try {
@@ -211,16 +200,16 @@ export class DirtyDiffModel implements Disposable {
     }
 
     protected isInGitRepository(repository: Repository): boolean {
-        const modelUri = new URI(this.uri).withoutScheme().toString();
+        const modelUri = this.editor.uri.withoutScheme().toString();
         const repoUri = new URI(repository.localUri).withoutScheme().toString();
         return modelUri.startsWith(repoUri);
     }
 
-    protected async getPreviousRevision(): Promise<string[]> {
+    protected async getPreviousRevision(): Promise<ContentLines | undefined> {
         const query = this.staged ? "" : "HEAD";
-        const uri = new URI(this.uri).withScheme(GIT_RESOURCE_SCHEME).withQuery(query);
+        const uri = this.editor.uri.withScheme(GIT_RESOURCE_SCHEME).withQuery(query);
         const contents = await this.readGitResource(uri);
-        return DirtyDiffModel.splitLines(contents);
+        return contents ? ContentLines.fromString(contents) : undefined;
     }
 
     dispose(): void {
@@ -232,35 +221,30 @@ export namespace DirtyDiffModel {
 
     const diffComputer = new DiffComputer();
 
-    export function computeDirtyDiff(previous: string[], current: string[]): DirtyDiff {
-        return diffComputer.computeDirtyDiff(previous, current);
+    /**
+     * Returns an eventually consistent result. E.g. it can happen, that lines are deleted during the computation,
+     * which will internally produce 'line out of bound' errors, then it will return `undefined`.
+     *
+     * `ContentLines` are to avoid copying contents which improves the performance, therefore handling of the `undefined`
+     * result, and rescheduling of the computation should be done by caller.
+     */
+    export function computeDirtyDiff(previous: ContentLines, current: ContentLines): DirtyDiff | undefined {
+        try {
+            return diffComputer.computeDirtyDiff(ContentLines.arrayLike(previous), ContentLines.arrayLike(current));
+        } catch {
+            return undefined;
+        }
     }
 
-    export function splitLines(text: string): string[] {
-        return text.split(/\r\n|\n/);
+    export function documentContentLines(document: TextEditorDocument): ContentLines {
+        return {
+            length: document.lineCount,
+            getLineContent: line => document.getLineContent(line + 1),
+        };
     }
 
     export interface GitResourceReader {
         (uri: URI): Promise<string>;
-    }
-
-    export class Throttler {
-
-        protected lastTask: () => void;
-        protected timeout: number | undefined;
-
-        constructor(protected readonly delay: number) { }
-
-        push(task: () => void): void {
-            this.lastTask = task;
-            if (!this.timeout) {
-                this.timeout = window.setTimeout(() => {
-                    this.timeout = undefined;
-                    this.lastTask();
-                }, this.delay);
-            }
-        }
-
     }
 
 }

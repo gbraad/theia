@@ -56,6 +56,9 @@ export class DirtyDiffDecorator {
     protected async setDecorations(editor: TextEditor, newDecorations: EditorDecoration[]) {
         const uri = editor.uri.toString();
         const oldDecorations = this.appliedDecorations.get(uri) || [];
+        if (oldDecorations.length === 0 && newDecorations.length === 0) {
+            return;
+        }
         const decorationIds = await editor.deltaDecorations({ uri, oldDecorations, newDecorations });
         this.appliedDecorations.set(uri, decorationIds);
     }

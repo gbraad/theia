@@ -41,7 +41,6 @@ export class DirtyDiffManager {
 
     @postConstruct()
     protected async initialize() {
-        this.preferences.onPreferenceChanged(async e => await this.handlePreferenceChange(e));
         this.editorManager.onCreated(async e => await this.handleEditorCreated(e));
         this.repositoryTracker.onGitEvent(throttle(async event => await this.handleGitStatusUpdate(event.source, event.status), 500));
         const gitStatus = this.repositoryTracker.selectedRepositoryStatus;
@@ -76,9 +75,8 @@ export class DirtyDiffManager {
     }
 
     protected createNewModel(editor: TextEditor): DirtyDiffModel {
-        const model = new DirtyDiffModel(editor, async gitUri => await this.readGitResourceContents(gitUri));
+        const model = new DirtyDiffModel(editor, this.preferences, async gitUri => await this.readGitResourceContents(gitUri));
         model.onDirtyDiffUpdate(e => this.onDirtyDiffUpdateEmitter.fire(e));
-        model.enabled = this.isEnabled();
         return model;
     }
 
@@ -101,18 +99,6 @@ export class DirtyDiffManager {
         return this.preferences["git.editor.decorations.enabled"];
     }
 
-    protected async handlePreferenceChange(event: PreferenceChangeEvent<GitConfiguration>): Promise<void> {
-        const { preferenceName, newValue } = event;
-        if (preferenceName === "git.editor.decorations.enabled") {
-            const enabled = !!newValue;
-            const allModels = this.models.values();
-            for (const model of allModels) {
-                model.enabled = enabled;
-                model.update();
-            }
-        }
-    }
-
 }
 
 export interface DirtyDiffUpdate extends DirtyDiff {
@@ -121,9 +107,9 @@ export interface DirtyDiffUpdate extends DirtyDiff {
 
 export class DirtyDiffModel implements Disposable {
 
-    enabled = true;
+    protected toDispose = new DisposableCollection();
 
-    protected dirty = true;
+    protected enabled = true;
     protected staged: boolean;
     protected previousContent: ContentLines | undefined;
     protected currentContent: ContentLines | undefined;
@@ -133,15 +119,39 @@ export class DirtyDiffModel implements Disposable {
 
     constructor(
         readonly editor: TextEditor,
+        readonly preferences: GitPreferences,
         protected readonly readGitResource: DirtyDiffModel.GitResourceReader
-    ) { }
+    ) {
+        this.toDispose.push(this.preferences.onPreferenceChanged(e => this.handlePreferenceChange(e)));
+    }
+
+    protected async handlePreferenceChange(event: PreferenceChangeEvent<GitConfiguration>): Promise<void> {
+        const { preferenceName, newValue } = event;
+        if (preferenceName === "git.editor.decorations.enabled") {
+            const enabled = !!newValue;
+            this.enabled = enabled;
+            this.update();
+        }
+    }
+
+    protected get linesLimit(): number {
+        const limit = this.preferences["git.editor.dirtydiff.linesLimit"];
+        return limit > 0 ? limit : Number.MAX_SAFE_INTEGER;
+    }
 
     protected updateTimeout: number | undefined;
 
+    protected shouldRender(): boolean {
+        if (!this.enabled || !this.previousContent || !this.currentContent) {
+            return false;
+        }
+        const limit = this.linesLimit;
+        return this.previousContent.length < limit && this.currentContent.length < limit;
+    }
+
     update(): void {
         const editor = this.editor;
-        const enabled = this.enabled && this.dirty;
-        if (!enabled || !this.previousContent || !this.currentContent) {
+        if (!this.shouldRender()) {
             this.onDirtyDiffUpdateEmitter.fire({ editor, added: [], removed: [], modified: [] });
             return;
         }
@@ -178,23 +188,22 @@ export class DirtyDiffModel implements Disposable {
         const modifiedChange = relevantChanges.find(c => c.status === GitFileStatus.Modified);
         const isModified = !!modifiedChange;
         if (isModified || isNewAndStaged) {
-            this.dirty = true;
             this.staged = isNewAndStaged || modifiedChange!.staged || false;
             try {
                 this.previousContent = await this.getPreviousRevision();
             } catch {
-                this.dirty = false;
                 this.previousContent = undefined;
             }
         }
         if (isNewAndUnstaged && !isNewAndStaged) {
-            this.dirty = false;
             this.previousContent = undefined;
         }
         if (noRelevantChanges && this.isInGitRepository(repository)) {
             try {
                 this.previousContent = await this.getPreviousRevision();
-            } catch { }
+            } catch {
+                this.previousContent = undefined;
+            }
         }
         this.update();
     }
@@ -213,6 +222,7 @@ export class DirtyDiffModel implements Disposable {
     }
 
     dispose(): void {
+        this.toDispose.dispose();
         this.onDirtyDiffUpdateEmitter.dispose();
     }
 }
